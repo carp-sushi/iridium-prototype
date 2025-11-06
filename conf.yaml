@@ -1,0 +1,7 @@
+---
+version: 1
+threads: 4
+pid_file: /tmp/iridium.pid
+error_log: /tmp/iridium_err.log
+upgrade_sock: /tmp/iridium.sock
+max_retries: 4

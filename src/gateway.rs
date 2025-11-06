@@ -39,7 +39,7 @@ fn check_auth(req: &pingora_http::RequestHeader) -> bool {
 /// Per-request context for sharing state
 #[derive(Default)]
 pub struct RetryCtx {
-    pub retries: u32,
+    pub retries: u8,
 }
 
 /// The gateway type
@@ -49,7 +49,7 @@ pub struct IridiumGateway;
 impl ProxyHttp for IridiumGateway {
     type CTX = RetryCtx;
     fn new_ctx(&self) -> Self::CTX {
-        Self::CTX::default()
+        Default::default()
     }
 
     // Handle incoming request, checking authorization for protected URIs.
@@ -76,12 +76,9 @@ impl ProxyHttp for IridiumGateway {
         error: Box<Error>,
     ) -> Box<Error> {
         ctx.retries += 1;
-        if ctx.retries <= 3 {
-            let mut retry_err = error;
-            retry_err.set_retry(true);
-            return retry_err;
-        }
-        error
+        let mut retry_err = error;
+        retry_err.set_retry(true); // Defaults to 16 tries
+        retry_err
     }
 
     // Determine which upstream peer to send requests to, delaying when a retry is detected
@@ -91,8 +88,9 @@ impl ProxyHttp for IridiumGateway {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         if ctx.retries > 0 {
-            let delay_ms = Duration::from_millis(u64::pow(10, ctx.retries + 1));
-            log::info!("retry w/ back-off ms: {delay_ms:?}");
+            let exp = (ctx.retries + 1) as u32;
+            let delay_ms = Duration::from_millis(u64::pow(10, exp).clamp(10, 10000));
+            log::info!("retry after back-off of: {delay_ms:?}");
             tokio::time::sleep(delay_ms).await;
         }
         let path = session.req_header().uri.path();
