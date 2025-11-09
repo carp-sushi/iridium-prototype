@@ -926,6 +926,7 @@ dependencies = [
  "lazy_static",
  "log",
  "pingora",
+ "pingora-cache",
  "pingora-core",
  "pingora-http",
  "pingora-proxy",

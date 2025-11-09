@@ -1,39 +1,35 @@
-// Copyright 2025 Cloudflare, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use async_trait::async_trait;
-use bytes::Bytes;
 use prometheus::{IntCounter, register_int_counter};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use pingora::cache::{
+    CacheKey, CacheMeta, ForcedInvalidationKind, HitHandler, MemCache, NoCacheReason,
+    RespCacheable, eviction::lru::Manager,
+};
 use pingora::prelude::Opt;
-use pingora_core::server::Server;
-use pingora_core::services::listening::Service;
-use pingora_core::upstreams::peer::HttpPeer;
-use pingora_core::{Error, Result};
+use pingora::server::Server;
+use pingora::services::listening::Service;
+use pingora::upstreams::peer::HttpPeer;
+use pingora::{Error, Result};
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 
-// Example static metric
-lazy_static::lazy_static! {
-    static ref REQ_METRIC: IntCounter =
-        register_int_counter!("req_counter", "Number of requests").unwrap();
-}
+// How long items are considered fresh when cached.
+const CACHE_TTL_SECS: u64 = 300; // 5 minutes
 
-// Example auth check
-fn check_auth(req: &pingora_http::RequestHeader) -> bool {
-    req.headers.get("Authorization").map(|v| v.as_bytes()) == Some(b"password")
+// Max backoff duration
+const MAX_DELAY_MS: u64 = 10000; // 10 seconds
+
+// Statics: request counter metric and in-memory cache (not production grade).
+lazy_static::lazy_static! {
+    static ref REQ_COUNTER: IntCounter =
+        register_int_counter!("req_counter", "Number of requests").unwrap();
+
+    // TODO: Find a production grade, durable cache that works with pingora.
+    static ref STORAGE: MemCache = MemCache::new();
+
+    // Cache eviction manager (5 shard LRU).
+    static ref MANAGER: Manager<5> = Manager::<5>::with_capacity(10_000_000, 100_000_000);
 }
 
 /// Per-request context for sharing state
@@ -45,6 +41,30 @@ pub struct RetryCtx {
 /// The gateway type
 pub struct IridiumGateway;
 
+impl IridiumGateway {
+    // Customize upstream selection based on URI path
+    fn select_upstream(&self, path: &str) -> (&str, u16) {
+        if path.starts_with("/bar") {
+            ("1.0.0.1", 443)
+        } else {
+            ("1.1.1.1", 443)
+        }
+    }
+
+    // Example auth check
+    fn check_auth(&self, req: &pingora_http::RequestHeader) -> bool {
+        req.headers.get("Authorization").map(|v| v.as_bytes()) == Some(b"password")
+    }
+
+    // Determine backoff time and delay for that duration
+    async fn backoff_delay(&self, retries: u8) {
+        let exp = retries as u32;
+        let delay_ms = Duration::from_millis(u64::pow(10, exp).clamp(10, MAX_DELAY_MS));
+        log::info!("retry after back-off of: {delay_ms:?}");
+        tokio::time::sleep(delay_ms).await;
+    }
+}
+
 #[async_trait]
 impl ProxyHttp for IridiumGateway {
     type CTX = RetryCtx;
@@ -55,11 +75,8 @@ impl ProxyHttp for IridiumGateway {
     // Handle incoming request, checking authorization for protected URIs.
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         let header = session.req_header();
-        if header.uri.path().starts_with("/bar") && !check_auth(header) {
-            let result = session
-                .respond_error_with_body(403, Bytes::from_static(b""))
-                .await;
-            if let Err(err) = result {
+        if header.uri.path().starts_with("/bar") && !self.check_auth(header) {
+            if let Err(err) = session.respond_error(403).await {
                 log::error!("error sending 403 response: {}", err)
             }
             return Ok(true);
@@ -88,18 +105,11 @@ impl ProxyHttp for IridiumGateway {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         if ctx.retries > 0 {
-            let exp = (ctx.retries + 1) as u32;
-            let delay_ms = Duration::from_millis(u64::pow(10, exp).clamp(10, 10000));
-            log::info!("retry after back-off of: {delay_ms:?}");
-            tokio::time::sleep(delay_ms).await;
+            self.backoff_delay(ctx.retries).await;
         }
         let path = session.req_header().uri.path();
-        let addr = if path.starts_with("/foo") {
-            ("1.0.0.1", 443)
-        } else {
-            ("1.1.1.1", 443)
-        };
-        log::info!("connecting to upstream: {addr:?} for path: {path}");
+        let addr = self.select_upstream(path);
+        log::info!("connecting to upstream {addr:?} for path {path}");
         let mut peer = HttpPeer::new(addr, true, "one.one.one.one".to_string());
         peer.options.connection_timeout = Some(Duration::from_secs(10));
         Ok(Box::new(peer))
@@ -126,18 +136,104 @@ impl ProxyHttp for IridiumGateway {
             .response_written()
             .map_or(0, |resp| resp.status.as_u16());
         let summary = self.request_summary(session, ctx);
-        log::info!("{}, status: {}", summary, status);
-        REQ_METRIC.inc();
+        REQ_COUNTER.inc();
+        log::info!(
+            "{}, status: {}, requests: {}",
+            summary,
+            status,
+            REQ_COUNTER.get()
+        );
+    }
+
+    // Decide if the request is cacheable and what cache backend to use.
+    // Ideally only `session.cache` should be modified here.
+    fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+        log::info!("request_cache_filter: enabling session cache");
+        session
+            .cache
+            .enable(&*STORAGE, Some(&*MANAGER), None, None, None);
+        Ok(())
+    }
+
+    // Decide if the response is cacheable
+    fn response_cache_filter(
+        &self,
+        session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<RespCacheable> {
+        log::info!("response_cache_filter: decide if the response is cacheable");
+        if !session.req_header().headers.contains_key("IridiumCacheKey") {
+            log::info!("uncacheable: no idempotency key");
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "No idempotency key header sent in request",
+            )));
+        }
+        if !resp.status.is_success() {
+            log::info!("uncacheable: not a success response");
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "Only success responses are cacheable",
+            )));
+        }
+        log::info!("cacheable");
+        let now = SystemTime::now();
+        let fresh_until = now
+            .checked_add(Duration::from_secs(CACHE_TTL_SECS))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let cache_meta = CacheMeta::new(fresh_until, now, 0, 0, resp.clone());
+        Ok(RespCacheable::Cacheable(cache_meta))
+    }
+
+    // Generate a cache key for a request when caching is enabled.
+    fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
+        log::info!("cache_key_callback: generating cache key");
+        let req_header = session.req_header();
+        let namespace = req_header
+            .headers
+            .get("IridiumCacheKey")
+            .map(|v| v.to_str().unwrap_or_default())
+            .unwrap_or_default();
+        let primary = format!("{} {}", req_header.method.as_str(), req_header.uri.path());
+        log::info!("namespace = {}, primary = {}", namespace, primary);
+        Ok(CacheKey::new(namespace, primary, ""))
+    }
+
+    // This callback is invoked when a cacheable response is ready to be admitted to cache
+    fn cache_miss(&self, session: &mut Session, _ctx: &mut Self::CTX) {
+        log::info!("cache_miss");
+        session.cache.cache_miss();
+    }
+
+    // This filter is called after a successful cache lookup
+    async fn cache_hit_filter(
+        &self,
+        _session: &mut Session,
+        meta: &CacheMeta,
+        _hit_handler: &mut HitHandler,
+        is_fresh: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<ForcedInvalidationKind>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        log::info!(
+            "cache_hit_filter: successful cache lookup; is_fresh = {}, age = {:?}",
+            is_fresh,
+            meta.age()
+        );
+        Ok(None)
     }
 }
 
-// RUST_LOG=INFO cargo run --bin gateway
+// RUST_LOG=INFO target/debug/gateway --conf conf.yaml
+//
 // curl 127.0.0.1:6191 -H "Host: one.one.one.one"
-// curl 127.0.0.1:6191/foo/ -H "Host: one.one.one.one"
+// curl 127.0.0.1:6191 -H "Host: one.one.one.one" -H "IridiumCacheKey: one.one.one.one"
 // curl 127.0.0.1:6191/bar/ -H "Host: one.one.one.one" -I -H "Authorization: password"
-// curl 127.0.0.1:6191/bar/ -H "Host: one.one.one.one" -I -H "Authorization: bad"
+//
 // For metrics
 // curl 127.0.0.1:6192/
+//
 fn main() {
     env_logger::init();
 
