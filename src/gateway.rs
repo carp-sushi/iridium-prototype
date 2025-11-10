@@ -22,6 +22,9 @@ const CACHE_TTL_SECS: u64 = 300; // 5 minutes
 // Max backoff duration
 const MAX_DELAY_MS: u64 = 10000; // 10 seconds
 
+// Cache activation idempotency key.
+const CACHE_KEY: &str = "IridiumCacheKey";
+
 // Statics: request counter metric and in-memory cache (not production grade).
 lazy_static::lazy_static! {
     static ref REQ_COUNTER: IntCounter =
@@ -156,31 +159,27 @@ impl ProxyHttp for IridiumGateway {
     // Decide if the request is cacheable and what cache backend to use.
     // Ideally only `session.cache` should be modified here.
     fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
-        log::info!("request_cache_filter: enabling session cache");
-        session.cache.enable(
-            &*CACHE_STORAGE,
-            Some(&*CACHE_MANAGER),
-            Some(&*CACHE_PREDICTOR),
-            Some(&*CACHE_LOCK),
-            None,
-        );
+        if session.req_header().headers.contains_key(CACHE_KEY) {
+            log::info!("request_cache_filter: enabling session cache");
+            session.cache.enable(
+                &*CACHE_STORAGE,
+                Some(&*CACHE_MANAGER),
+                Some(&*CACHE_PREDICTOR),
+                Some(&*CACHE_LOCK),
+                None,
+            );
+        }
         Ok(())
     }
 
     // Decide if the response is cacheable
     fn response_cache_filter(
         &self,
-        session: &Session,
+        _session: &Session,
         resp: &ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
         log::info!("response_cache_filter: decide if the response is cacheable");
-        if !session.req_header().headers.contains_key("IridiumCacheKey") {
-            log::info!("uncacheable: no idempotency key");
-            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
-                "No idempotency key header sent in request",
-            )));
-        }
         if !resp.status.is_success() {
             log::info!("uncacheable: not a success response");
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
@@ -202,7 +201,7 @@ impl ProxyHttp for IridiumGateway {
         let req_header = session.req_header();
         let namespace = req_header
             .headers
-            .get("IridiumCacheKey")
+            .get(CACHE_KEY)
             .map(|v| v.to_str().unwrap_or_default())
             .unwrap_or_default();
         let primary = format!("{} {}", req_header.method.as_str(), req_header.uri.path());
