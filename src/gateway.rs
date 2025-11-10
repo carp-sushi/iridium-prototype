@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use pingora_cache::lock::CacheLock;
+use pingora_cache::predictor::Predictor;
 use prometheus::{IntCounter, register_int_counter};
 use std::time::{Duration, SystemTime};
 
@@ -26,10 +28,16 @@ lazy_static::lazy_static! {
         register_int_counter!("req_counter", "Number of requests").unwrap();
 
     // TODO: Find a production grade, durable cache that works with pingora.
-    static ref STORAGE: MemCache = MemCache::new();
+    static ref CACHE_STORAGE: MemCache = MemCache::new();
 
     // Cache eviction manager (5 shard LRU).
-    static ref MANAGER: Manager<5> = Manager::<5>::with_capacity(10_000_000, 100_000_000);
+    static ref CACHE_MANAGER: Manager<5> = Manager::<5>::with_capacity(10_000_000, 100_000_000);
+
+    // Cache predictor
+    static ref CACHE_PREDICTOR: Predictor<5> = Predictor::<5>::new(100_000_000, None);
+
+    // Cache lock w/ timeout
+    static ref CACHE_LOCK: CacheLock = CacheLock::new(Duration::from_secs(30));
 }
 
 /// Per-request context for sharing state
@@ -149,9 +157,13 @@ impl ProxyHttp for IridiumGateway {
     // Ideally only `session.cache` should be modified here.
     fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
         log::info!("request_cache_filter: enabling session cache");
-        session
-            .cache
-            .enable(&*STORAGE, Some(&*MANAGER), None, None, None);
+        session.cache.enable(
+            &*CACHE_STORAGE,
+            Some(&*CACHE_MANAGER),
+            Some(&*CACHE_PREDICTOR),
+            Some(&*CACHE_LOCK),
+            None,
+        );
         Ok(())
     }
 
