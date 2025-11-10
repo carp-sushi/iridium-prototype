@@ -12,7 +12,7 @@ use pingora::prelude::Opt;
 use pingora::server::Server;
 use pingora::services::listening::Service;
 use pingora::upstreams::peer::HttpPeer;
-use pingora::{Error, Result};
+use pingora::{Error, ErrorType, Result};
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 
@@ -105,7 +105,7 @@ impl ProxyHttp for IridiumGateway {
     ) -> Box<Error> {
         ctx.retries += 1;
         let mut retry_err = error;
-        retry_err.set_retry(true); // Defaults to 16 tries
+        retry_err.set_retry(true); // Defaults to 16 tries, can be changed in config
         retry_err
     }
 
@@ -203,16 +203,18 @@ impl ProxyHttp for IridiumGateway {
             .headers
             .get(CACHE_KEY)
             .map(|v| v.to_str().unwrap_or_default())
-            .unwrap_or_default();
-        let primary = format!("{} {}", req_header.method.as_str(), req_header.uri.path());
-        log::info!("namespace = {}, primary = {}", namespace, primary);
+            .unwrap_or_default()
+            .trim();
+        if namespace.is_empty() {
+            return Err(Error::new(ErrorType::InvalidHTTPHeader));
+        }
+        let primary = format!("{}{}", req_header.method.as_str(), req_header.uri.path());
+        log::info!(
+            "cache_key: namespace = {}, primary = {}",
+            namespace,
+            primary
+        );
         Ok(CacheKey::new(namespace, primary, ""))
-    }
-
-    // This callback is invoked when a cacheable response is ready to be admitted to cache
-    fn cache_miss(&self, session: &mut Session, _ctx: &mut Self::CTX) {
-        log::info!("cache_miss");
-        session.cache.cache_miss();
     }
 
     // This filter is called after a successful cache lookup
