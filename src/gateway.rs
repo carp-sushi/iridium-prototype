@@ -25,7 +25,14 @@ const MAX_DELAY_MS: u64 = 10000; // 10 seconds
 // Cache activation idempotency key.
 const CACHE_KEY: &str = "IridiumCacheKey";
 
-// Statics: request counter metric and in-memory cache (not production grade).
+// LRU sizing
+const CACHE_SIZE_LIMIT: usize = 10_000_000;
+const CACHE_SHARD_CAPACITY: usize = 100_000_000;
+
+// Base for how long locks can be held.
+const CACHE_LOCK_SECS: u64 = 30;
+
+// Lazy initialized statics: request counter metric and in-memory cache (not production grade).
 lazy_static::lazy_static! {
     static ref REQ_COUNTER: IntCounter =
         register_int_counter!("req_counter", "Number of requests").unwrap();
@@ -34,13 +41,14 @@ lazy_static::lazy_static! {
     static ref CACHE_STORAGE: MemCache = MemCache::new();
 
     // Cache eviction manager (5 shard LRU).
-    static ref CACHE_MANAGER: Manager<5> = Manager::<5>::with_capacity(10_000_000, 100_000_000);
+    static ref CACHE_MANAGER: Manager<5> =
+        Manager::<5>::with_capacity(CACHE_SIZE_LIMIT, CACHE_SHARD_CAPACITY);
 
     // Cache predictor
-    static ref CACHE_PREDICTOR: Predictor<5> = Predictor::<5>::new(100_000_000, None);
+    static ref CACHE_PREDICTOR: Predictor<5> = Predictor::<5>::new(CACHE_SHARD_CAPACITY, None);
 
-    // Cache lock w/ timeout
-    static ref CACHE_LOCK: CacheLock = CacheLock::new(Duration::from_secs(30));
+    // Cache locking with timeouts
+    static ref CACHE_LOCK: CacheLock = CacheLock::new(Duration::from_secs(CACHE_LOCK_SECS));
 }
 
 /// Per-request context for sharing state
