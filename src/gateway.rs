@@ -26,8 +26,8 @@ const MAX_DELAY_MS: u64 = 10000; // 10 seconds
 const CACHE_KEY: &str = "IridiumCacheKey";
 
 // LRU sizing
-const CACHE_SIZE_LIMIT: usize = 10_000_000;
-const CACHE_SHARD_CAPACITY: usize = 100_000_000;
+const CACHE_SIZE_LIMIT: usize = 1024 * 1024; // 1MB
+const CACHE_SHARD_CAPACITY: usize = CACHE_SIZE_LIMIT * 100; // MB
 
 // Base for how long locks can be held.
 const CACHE_LOCK_SECS: u64 = 30;
@@ -40,14 +40,14 @@ lazy_static::lazy_static! {
     // TODO: Find a production grade, durable cache that works with pingora.
     static ref CACHE_STORAGE: MemCache = MemCache::new();
 
-    // Cache eviction manager (5 shard LRU).
-    static ref CACHE_MANAGER: Manager<5> =
-        Manager::<5>::with_capacity(CACHE_SIZE_LIMIT, CACHE_SHARD_CAPACITY);
+    // Cache eviction manager (10 shard LRU).
+    static ref CACHE_MANAGER: Manager<10> =
+        Manager::<10>::with_capacity(CACHE_SIZE_LIMIT, CACHE_SHARD_CAPACITY);
 
-    // Cache predictor
-    static ref CACHE_PREDICTOR: Predictor<5> = Predictor::<5>::new(CACHE_SHARD_CAPACITY, None);
+    // Cache predictor (10 shards, each with the capacity for remembering 100 uncachable keys).
+    static ref CACHE_PREDICTOR: Predictor<10> = Predictor::<10>::new(100, None);
 
-    // Cache locking with timeouts
+    // Cache locking with timeout (how long a writer can hold onto a particular lock).
     static ref CACHE_LOCK: CacheLock = CacheLock::new(Duration::from_secs(CACHE_LOCK_SECS));
 }
 
@@ -167,6 +167,9 @@ impl ProxyHttp for IridiumGateway {
     // Decide if the request is cacheable and what cache backend to use.
     // Ideally only `session.cache` should be modified here.
     fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+        if std::env::var("IRIDIUM_FORCE_CACHE_DISABLE").is_ok() {
+            return Ok(());
+        }
         if session.req_header().headers.contains_key(CACHE_KEY) {
             log::info!("request_cache_filter: enabling session cache");
             session.cache.enable(
