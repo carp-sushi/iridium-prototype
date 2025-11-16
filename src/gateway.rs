@@ -25,11 +25,14 @@ const MAX_DELAY_MS: u64 = 10000; // 10 seconds
 // Cache activation idempotency key.
 const CACHE_KEY: &str = "IridiumCacheKey";
 
-// LRU sizing
-const CACHE_SIZE_LIMIT: usize = 1024 * 1024; // 1MB
-const CACHE_SHARD_CAPACITY: usize = CACHE_SIZE_LIMIT * 100; // MB
+// Optional user provided tag to be included when building a cache key.
+const CACHE_USER_TAG: &str = "IridiumUserTag";
 
-// Base for how long locks can be held.
+// LRU sizing
+const CACHE_VALUE_SIZE_LIMIT: usize = 1024 * 1024; // 1MB
+const CACHE_SHARD_CAPACITY: usize = CACHE_VALUE_SIZE_LIMIT * 100; // 100MB
+
+// After this timeout is reached, all read locks are automatically unlocked.
 const CACHE_LOCK_SECS: u64 = 30;
 
 // Lazy initialized statics: request counter metric and in-memory cache (not production grade).
@@ -42,7 +45,7 @@ lazy_static::lazy_static! {
 
     // Cache eviction manager (10 shard LRU).
     static ref CACHE_MANAGER: Manager<10> =
-        Manager::<10>::with_capacity(CACHE_SIZE_LIMIT, CACHE_SHARD_CAPACITY);
+        Manager::<10>::with_capacity(CACHE_VALUE_SIZE_LIMIT, CACHE_SHARD_CAPACITY);
 
     // Cache predictor (10 shards, each with the capacity for remembering 100 uncachable keys).
     static ref CACHE_PREDICTOR: Predictor<10> = Predictor::<10>::new(100, None);
@@ -81,6 +84,14 @@ impl IridiumGateway {
         let delay_ms = Duration::from_millis(u64::pow(10, exp).clamp(10, MAX_DELAY_MS));
         log::info!("retry after back-off of: {delay_ms:?}");
         tokio::time::sleep(delay_ms).await;
+    }
+
+    // Get a header value as a `&str`.
+    fn get_header<'a>(&self, req: &'a pingora_http::RequestHeader, key: &str) -> &'a str {
+        req.headers
+            .get(key)
+            .map(|v| v.to_str().unwrap_or_default().trim())
+            .unwrap_or_default()
     }
 }
 
@@ -210,22 +221,20 @@ impl ProxyHttp for IridiumGateway {
     fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
         log::info!("cache_key_callback: generating cache key");
         let req_header = session.req_header();
-        let namespace = req_header
-            .headers
-            .get(CACHE_KEY)
-            .map(|v| v.to_str().unwrap_or_default())
-            .unwrap_or_default()
-            .trim();
+        let namespace = self.get_header(req_header, CACHE_KEY);
         if namespace.is_empty() {
             return Err(Error::new(ErrorType::InvalidHTTPHeader));
         }
+        // Incorporate the request method into the primary field (default is URI only).
         let primary = format!("{}{}", req_header.method.as_str(), req_header.uri.path());
+        let user_tag = self.get_header(req_header, CACHE_USER_TAG);
         log::info!(
-            "cache_key: namespace = {}, primary = {}",
+            "cache_key: namespace = {}, primary = {}, user_tag = {}",
             namespace,
-            primary
+            primary,
+            user_tag,
         );
-        Ok(CacheKey::new(namespace, primary, ""))
+        Ok(CacheKey::new(namespace, primary, user_tag))
     }
 
     // This filter is called after a successful cache lookup
@@ -255,7 +264,7 @@ impl ProxyHttp for IridiumGateway {
 // curl 127.0.0.1:6191 -H "Host: one.one.one.one" -H "IridiumCacheKey: one.one.one.one"
 // curl 127.0.0.1:6191/bar/ -H "Host: one.one.one.one" -I -H "Authorization: password"
 //
-// For metrics
+// For metrics (does not work currently)
 // curl 127.0.0.1:6192/
 //
 fn main() {
