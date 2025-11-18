@@ -1,19 +1,18 @@
 use async_trait::async_trait;
-use pingora_cache::lock::CacheLock;
-use pingora_cache::predictor::Predictor;
 use prometheus::{IntCounter, register_int_counter};
+use std::env;
 use std::time::{Duration, SystemTime};
 
 use pingora::cache::{
     CacheKey, CacheMeta, ForcedInvalidationKind, HitHandler, MemCache, NoCacheReason,
-    RespCacheable, eviction::lru::Manager,
+    RespCacheable, eviction::lru::Manager, lock::CacheLock, predictor::Predictor,
 };
 use pingora::prelude::Opt;
 use pingora::server::Server;
 use pingora::services::listening::Service;
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result};
-use pingora_http::ResponseHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 
 // How long items are considered fresh when cached.
@@ -66,28 +65,24 @@ pub struct IridiumGateway;
 impl IridiumGateway {
     // Customize upstream selection based on URI path
     fn select_upstream(&self, path: &str) -> (&str, u16) {
-        if path.starts_with("/bar") {
+        if path.starts_with("/foo") || path.starts_with("/bar") {
             ("1.0.0.1", 443)
         } else {
             ("1.1.1.1", 443)
         }
     }
 
-    // Example auth check
-    fn check_auth(&self, req: &pingora_http::RequestHeader) -> bool {
-        req.headers.get("Authorization").map(|v| v.as_bytes()) == Some(b"password")
-    }
-
     // Determine backoff time and delay for that duration
     async fn backoff_delay(&self, retries: u8) {
         let exp = retries as u32;
-        let delay_ms = Duration::from_millis(u64::pow(10, exp).clamp(10, MAX_DELAY_MS));
-        log::info!("retry after back-off of: {delay_ms:?}");
-        tokio::time::sleep(delay_ms).await;
+        let delay_ms = u64::pow(10, exp).clamp(10, MAX_DELAY_MS);
+        let delay = Duration::from_millis(delay_ms);
+        log::info!("retry after back-off of: {delay:?}");
+        tokio::time::sleep(delay).await;
     }
 
     // Get a header value as a `&str`.
-    fn get_header<'a>(&self, req: &'a pingora_http::RequestHeader, key: &str) -> &'a str {
+    fn get_header<'a>(&self, req: &'a RequestHeader, key: &str) -> &'a str {
         req.headers
             .get(key)
             .map(|v| v.to_str().unwrap_or_default().trim())
@@ -102,10 +97,10 @@ impl ProxyHttp for IridiumGateway {
         Default::default()
     }
 
-    // Handle incoming request, checking authorization for protected URIs.
+    // Handle incoming request, blocking protected URIs.
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         let header = session.req_header();
-        if header.uri.path().starts_with("/bar") && !self.check_auth(header) {
+        if header.uri.path().starts_with("/private") {
             if let Err(err) = session.respond_error(403).await {
                 log::error!("error sending 403 response: {}", err)
             }
@@ -178,7 +173,7 @@ impl ProxyHttp for IridiumGateway {
     // Decide if the request is cacheable and what cache backend to use.
     // Ideally only `session.cache` should be modified here.
     fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
-        if std::env::var("IRIDIUM_FORCE_CACHE_DISABLE").is_ok() {
+        if env::var("IRIDIUM_FORCE_CACHE_DISABLE").is_ok() {
             return Ok(());
         }
         if session.req_header().headers.contains_key(CACHE_KEY) {
@@ -262,9 +257,13 @@ impl ProxyHttp for IridiumGateway {
 //
 // curl 127.0.0.1:6191 -H "Host: one.one.one.one"
 // curl 127.0.0.1:6191 -H "Host: one.one.one.one" -H "IridiumCacheKey: one.one.one.one"
-// curl 127.0.0.1:6191/bar/ -H "Host: one.one.one.one" -I -H "Authorization: password"
 //
-// For metrics (does not work currently)
+// curl 127.0.0.1:6191/foo/ -H "Host: one.one.one.one"
+// curl 127.0.0.1:6191/bar/ -H "Host: one.one.one.one"
+//
+// curl 127.0.0.1:6191/private/ -H "Host: one.one.one.one" # blocked, will 403
+//
+// For metrics (doesn't work currently)
 // curl 127.0.0.1:6192/
 //
 fn main() {
